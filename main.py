@@ -72,9 +72,16 @@ app.add_middleware(
 app.add_middleware(RequestContextMiddleware)
 
 
+
 @app.get("/ping")
 async def ping(request: Request):
-    return {
-        "email": EMAIL,
-        "request_id": request.state.request_id,
-    }
+    request_id = request.state.request_id
+
+    return JSONResponse(
+        content={
+            "email": EMAIL,
+            "request_id": request_id,
+        },
+        headers={"X-Request-ID": request_id},
+    )
+
