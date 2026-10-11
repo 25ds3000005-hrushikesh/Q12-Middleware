@@ -5,12 +5,12 @@ from collections import defaultdict, deque
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
 EMAIL = "25ds3000005@ds.study.iitm.ac.in"
+
 ALLOWED_ORIGINS = [
     "https://app-h7eelc.example.com",
     "https://exam.sanand.workers.dev",
@@ -22,25 +22,65 @@ requests_by_client = defaultdict(deque)
 
 
 # Middleware 1: Request context
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        request.state.request_id = request_id
+class RequestContextMiddleware:
+    def __init__(self, app):
+        self.app = app
 
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        incoming_id = headers.get(b"x-request-id")
+
+        request_id = (
+            incoming_id.decode("latin-1")
+            if incoming_id
+            else str(uuid.uuid4())
+        )
+
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                response_headers = [
+                    (key, value)
+                    for key, value in message.get("headers", [])
+                    if key.lower() != b"x-request-id"
+                ]
+                response_headers.append(
+                    (b"x-request-id", request_id.encode("latin-1"))
+                )
+                message["headers"] = response_headers
+
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
 
 
 # Middleware 2: Per-client rate limiter
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path != "/ping" or request.method != "GET":
-            return await call_next(request)
+class RateLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
 
-        client_id = request.headers.get("X-Client-Id")
-        if not client_id:
-            client_id = request.client.host if request.client else "unknown"
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if scope["path"] != "/ping" or scope["method"] != "GET":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        client_id = headers.get(b"x-client-id")
+
+        if client_id:
+            client_id = client_id.decode("latin-1")
+        else:
+            client = scope.get("client")
+            client_id = client[0] if client else "unknown"
 
         now = time.monotonic()
         timestamps = requests_by_client[client_id]
@@ -49,16 +89,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             timestamps.popleft()
 
         if len(timestamps) >= LIMIT:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
             )
+            await response(scope, receive, send)
+            return
 
         timestamps.append(now)
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
-# Add middleware in the correct order
+# Register middleware
 app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
@@ -66,11 +108,14 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "OPTIONS"],
-    allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
+    allow_headers=[
+        "X-Request-ID",
+        "X-Client-Id",
+        "Content-Type",
+    ],
 )
 
 app.add_middleware(RequestContextMiddleware)
-
 
 
 @app.get("/ping")
@@ -84,4 +129,3 @@ async def ping(request: Request):
         },
         headers={"X-Request-ID": request_id},
     )
-
